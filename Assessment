@@ -1,0 +1,83 @@
+// I started by defining an optimized SQL query to get the top 1,000,000 records from the 'received' table
+// where the 'status' column equals 1. I ordered the results by 're_ref' to organize the data.
+string sql = "SELECT TOP 1000000 * FROM received WHERE status = 1 ORDER BY re_ref";
+
+//  I then retrieved the list of SQL nodes to query. These nodes represent different database instances or servers,
+// and I got this list from the configuration settings of the application.
+IEnumerable<IConfigurationSection> SqlNodes = Program.Configuration.GetSection("ConnectionStrings").GetSection("SqlNodes").GetChildren();
+
+// I used a ConcurrentBag to store the results from all SQL nodes. 
+// I chose ConcurrentBag because it handles thread-safe operations, which is crucial when multiple threads 
+// are adding data at the same time.
+ConcurrentBag<received> results = new ConcurrentBag<received>();
+
+// To improve performance, I executed queries on each SQL node concurrently using Parallel.ForEach.
+// This way, I could handle multiple queries simultaneously across different nodes.
+Parallel.ForEach(SqlNodes, Node =>
+{
+    // For each SQL node, I queried the database and fetched the results.
+    // The DBQuery<T> method helps in executing the query and getting an array of results.
+    received[] result = DBQuery<received>.Query(Node.Value, sql);
+    
+    // I added each record to the ConcurrentBag. This operation is thread-safe, so it ensures that even if 
+    // multiple threads are adding records at once, it will work correctly.
+    foreach (var rec in result)
+    {
+        results.Add(rec);
+    }
+});
+
+// Instead of using a simple list, I switched to ConcurrentBag<received>. 
+// This collection is designed to handle concurrent additions safely, avoiding issues that can arise from parallel processing.
+
+//  Next, I established a single connection to the database for inserting the results in batches.
+using (SqlConnection connection = new SqlConnection(ConnectionString))
+{
+    connection.Open(); // I opened the connection once and reused it for all insert operations.
+    
+    // I began a transaction to ensure that all insert operations are treated as a single unit of work.
+    using (SqlTransaction transaction = connection.BeginTransaction())
+    {
+        using (SqlCommand command = new SqlCommand())
+        {
+            command.Connection = connection;
+            command.Transaction = transaction;
+
+            //  I used StringBuilder to efficiently construct SQL insert statements.
+            StringBuilder sb = new StringBuilder(); 
+            foreach (received rec in results)
+            {
+                // I prepared the INSERT statement with parameters to prevent SQL injection attacks.
+                sb.Append("INSERT INTO received_total (rt_msisdn, rt_message) VALUES (@msisdn, @message); ");
+                command.Parameters.AddWithValue("@msisdn", rec.re_fromnum);
+                command.Parameters.AddWithValue("@message", rec.re_message);
+
+                //  I executed the batch of insert statements when the accumulated SQL length exceeded 1,000 characters.
+                if (sb.Length > 1000)
+                {
+                    command.CommandText = sb.ToString();
+                    command.ExecuteNonQuery(); // I executed the batched INSERT statements.
+                    sb.Clear(); // I cleared the StringBuilder to start building the next batch of statements.
+                    command.Parameters.Clear(); // I cleared the parameters to avoid duplication.
+                }
+            }
+
+            // After the loop, I executed any remaining INSERT statements that didn't meet the batch size requirement.
+            if (sb.Length > 0)
+            {
+                command.CommandText = sb.ToString();
+                command.ExecuteNonQuery(); // I performed the final execution of the remaining inserts.
+            }
+        }
+
+        // I committed the transaction to ensure all insert operations were completed successfully.
+        transaction.Commit();
+    }
+
+    connection.Close(); // I closed the connection once all operations were done.
+}
+
+// Instead of inserting records one by one, I gathered multiple records and inserted them in batches. 
+// This approach reduces the number of database connections and speeds up the process. 
+// Using transactions ensures that all batch inserts are handled as a single unit of work. If any error occurs, 
+// the transaction can be rolled back, which maintains data integrity by preventing partial inserts.
